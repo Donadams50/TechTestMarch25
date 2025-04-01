@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 
-const postSchema = new mongoose.Schema({
+const postSchema = new mongoose.Schema(
+  {
   title: {
     type: String,
     required: true,
@@ -12,20 +13,28 @@ const postSchema = new mongoose.Schema({
   },
   tags: {
     type: [String],
-    default: []
+    default: [],
+    index: true 
   },
-  createdAt: {
-    type: Date,
-    default: Date.now
+  
+},
+
+{
+  timestamps: true,
+}
+);
+// text index for search ( index on title + content) this gives room for optimizing the search query and makes it low latency
+postSchema.index({ 
+  title: 'text', 
+  content: 'text' 
+}, { 
+  weights: {
+    title: 3,   
+    content: 1 
   },
-  updatedAt: {
-    type: Date
-  }
+  name: 'post_text_search' 
 });
 
-postSchema.pre('save', function (next) {
-  this.updatedAt = new Date();
-  next();
-});
+
 
 module.exports = mongoose.model('Post', postSchema);
