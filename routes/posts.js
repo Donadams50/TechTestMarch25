@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const Post = require('../models/Post');
 const validateId = require('../helpers/validateId'); 
+const ApiError = require('../helpers/apiError');
+
 
 // GET all posts with pagination and optional tag filter
 router.get('/', async (req, res, next) => {
@@ -39,7 +41,7 @@ router.get('/', async (req, res, next) => {
 router.get('/:id', validateId, async (req, res, next) => {
   try {
     const post = await Post.findById(req.params.id);
-    if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (!post)  throw new ApiError(404, 'Post not found');
     res.json(post);
   } catch (err) {
     next(err);
@@ -86,7 +88,7 @@ router.put('/:id', validateId, async (req, res, next) => {
       updates,
       { new: true } 
     );
-    if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (!post) throw new ApiError(404, 'Post not found'); 
     res.json(post);
 
   } catch (err) {
@@ -98,7 +100,7 @@ router.put('/:id', validateId, async (req, res, next) => {
 router.delete('/:id', validateId, async (req, res, next) => {
   try {
     const result = await Post.findByIdAndDelete(req.params.id);
-    if (!result) return res.status(404).json({ error: 'Post not found' });
+    if (!result)  throw new ApiError(404, 'Post not found'); 
     res.json({ success: true });
   } catch (err) {
     next(err);
@@ -115,9 +117,9 @@ router.get('/search/all', async (req, res, next) => {
       return res.status(400).json({ error: 'Search query (q) is required' });
     }
 
-    // Convert query parameters to numbers and validate pagination, limit should not be more than 50
+    // Convert query parameters to numbers and validate pagination, limit is cap at 50 itmes
     const pageNum = Math.max(1, parseInt(page));
-    const limitNum = Math.min(50, Math.max(1, parseInt(limit))); // Cap at 50 items
+    const limitNum = Math.min(50, Math.max(1, parseInt(limit))); 
 
     
     const [results, total] = await Promise.all([
@@ -148,44 +150,47 @@ router.get('/search/all', async (req, res, next) => {
   }
 });
 
-// routes/posts.js
+// Bulk delete endpoint.    
+// I used hard delete because UK  is big on GDPR compliance
+// I used the batch method because deleting long dataset takes times and MongoDB may kill long-running operations. Default timeout: 60 seconds
 router.delete('/', async (req, res, next) => {
   try {
     const { tag } = req.query;
+    const BATCH_SIZE = 1000;
 
-    // Validation
     if (!tag) {
-      return res.status(400).json({ 
-        error: 'Tag parameter is required (e.g., /posts?tag=js)' 
-      });
+      throw new ApiError(400, 'Tag parameter is required');   
     }
 
-    // Batch deletion (1000 docs per batch) to make it optimized
-    const BATCH_SIZE = 1000;
     let totalDeleted = 0;
-    let shouldContinue = true;
+    let documentsExist = true;
 
-    while (shouldContinue) {
-      const result = await Post.deleteMany({ 
-        tags: tag 
-      }).limit(BATCH_SIZE);
+    while (documentsExist) {
+      // Find a batch of documents to delete which only fetches the  IDs for efficiency
+      const batch = await Post.find({ tags: tag })
+        .limit(BATCH_SIZE)
+        .select('_id');
+
+      if (batch.length === 0) {
+        documentsExist = false;
+        continue;
+      }
+
+      // Delete the particular  batch by IDs
+      const result = await Post.deleteMany({
+        _id: { $in: batch.map(doc => doc._id) }
+      });
 
       totalDeleted += result.deletedCount;
-      shouldContinue = result.deletedCount === BATCH_SIZE;
-
     }
 
-    // Handle no documents found edge case
     if (totalDeleted === 0) {
-      return res.status(404).json({ 
-        message: `No posts found with tag '${tag}'` 
-      });
+      throw new ApiError(400, `No posts found with tag '${tag}'`);
     }
 
     res.json({
       success: true,
-      message: `Deleted ${totalDeleted} posts with tag '${tag}'`,
-      deletedCount: totalDeleted
+      message: `Deleted ${totalDeleted} posts with tag '${tag}'`
     });
 
   } catch (err) {
