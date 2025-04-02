@@ -1,34 +1,58 @@
 const express = require('express');
 const router = express.Router();
 const Post = require('../models/Post');
+const validateId = require('../helpers/validateId'); 
+const ApiError = require('../helpers/apiError');
+
 
 // GET all posts with pagination and optional tag filter
 router.get('/', async (req, res, next) => {
   try {
     const { page = 1, limit = 10, tag } = req.query;
     const filter = tag ? { tags: tag } : {};
-    const posts = await Post.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .skip((parseInt(page) - 1) * parseInt(limit));
-    res.json(posts);
+
+    // queries in parallel for better performance
+    const [posts, total] = await Promise.all([
+      Post.find(filter)
+        .sort({ createdAt: -1 })
+        .limit(parseInt(limit))
+        .skip((parseInt(page) - 1) * parseInt(limit)),
+        
+      Post.countDocuments(filter) // Get total  documents
+    ]);
+
+    res.json({
+      data: posts,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / parseInt(limit)),
+        hasNext: parseInt(page) * parseInt(limit) < total
+      }
+    });
+
   } catch (err) {
     next(err);
   }
 });
 
 // GET single post by ID
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', validateId, async (req, res, next) => {
   try {
     const post = await Post.findById(req.params.id);
-    if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (!post)  throw new ApiError(404, 'Post not found');
     res.json(post);
   } catch (err) {
     next(err);
   }
 });
 
-// POST create a new post (contains tricky bugs)
+// POST create a new post ( tricky bugs fixed)
+// I used the mongoose in built timestamp, which is more robust.
+// Mongoose automatically handles timestamps on all updates (including findOneAndUpdate, which the  original pre('save') hook would miss).
+// No need for a pre('save') hook or manual default values.
+//That's the best practice
 router.post('/', async (req, res, next) => {
   try {
     const { title, content, tags } = req.body;
@@ -40,8 +64,7 @@ router.post('/', async (req, res, next) => {
     const newPost = new Post({
       title,
       content,
-      tags,
-      createdAt: new Date()  // Bug: overrides default, but doesn't set updatedAt
+      tags
     });
 
     await newPost.save();
@@ -51,33 +74,135 @@ router.post('/', async (req, res, next) => {
   }
 });
 
-// PUT update post (contains tricky bug)
-router.put('/:id', async (req, res, next) => {
+// PUT update post ( tricky bug fixed)
+// I Use findByIdAndUpdate
+// timestamps: true ensures updatedAt is always updated on findByIdAndUpdate.
+// If no actual changes were made (e.g., sending the same title/content), Mongoose skips the save(), so updatedAt doesn’t update.
+// but with my solution, the updatedAt will change even if no actual changes were made to the payload
+router.put('/:id', validateId, async (req, res, next) => {
   try {
-    const updates = req.body;
-
-    const post = await Post.findById(req.params.id);
-    if (!post) return res.status(404).json({ error: 'Post not found' });
-
-    Object.assign(post, updates);
-
-    await post.save();  // Bug: updatedAt isn't updated if save is skipped
-
+    const { title, content, tags } = req.body;
+    
+    if (title === '' || content === '') {
+      throw new ApiError(400, 'Title/content cannot be empty');
+    }
+    const post = await Post.findByIdAndUpdate(
+      req.params.id,
+      title,
+      content,
+      tags,
+      { new: true } 
+    );
+    if (!post) throw new ApiError(404, 'Post not found'); 
     res.json(post);
+
   } catch (err) {
     next(err);
   }
 });
 
-// DELETE post (unexpected behavior if ID is malformed)
-router.delete('/:id', async (req, res, next) => {
+// DELETE post (unexpected behavior if ID is malformed (Fixed) 
+// // Created a validator middleware file in my helper folder), it validates the Id before proceeeding
+router.delete('/:id', validateId, async (req, res, next) => {
   try {
     const result = await Post.findByIdAndDelete(req.params.id);
-    if (!result) return res.status(404).json({ error: 'Post not found' });
+    if (!result)  throw new ApiError(404, 'Post not found'); 
     res.json({ success: true });
   } catch (err) {
     next(err);
   }
 });
 
+// optimized search endpoint. an index on content and title have been created in the schema
+// Using "/search/all" instead of "/search" to avoid conflicts with the "GET by ID" route
+router.get('/search/all', async (req, res, next) => {
+  try {
+    const { q: searchTerm, page = 1, limit = 10 } = req.query;
+
+    // Validating search term
+    if (!searchTerm || searchTerm.trim() === '') {
+      throw new ApiError(400, 'Search query (q) is required');
+    }
+
+    // Convert query parameters to numbers and validate pagination, limit is cap at 50 itmes
+    const pageNum = Math.max(1, parseInt(page));
+    const limitNum = Math.min(50, Math.max(1, parseInt(limit))); 
+
+    
+    const [results, total] = await Promise.all([
+      Post.find(
+        { $text: { $search: searchTerm } },
+        { score: 0 }
+      )
+      .sort({ score: { $meta: 'textScore' } })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum),
+
+      Post.countDocuments({ $text: { $search: searchTerm } })
+    ]);
+
+    res.json({
+      data: results,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum),
+        hasNext: pageNum * limitNum < total
+      }
+    });
+
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Bulk delete endpoint.    
+// Depending on business need, I can either do soft delete or hard delete(permanant delete)
+// I used hard delete because UK is big on GDPR compliance
+// I used the batch method because deleting long dataset takes times and MongoDB may kill long-running operations. Default timeout: 60 seconds (Imagining I am deleting 100k records)
+router.delete('/', async (req, res, next) => {
+  try {
+    const { tag } = req.query;
+    const BATCH_SIZE = 1000;
+
+    if (!tag) {
+      throw new ApiError(400, 'Tag parameter is required');   
+    }
+
+    let totalDeleted = 0;
+    let documentsExist = true;
+
+    while (documentsExist) {
+      // Find a batch of documents to delete which only fetches the  IDs for efficiency
+      const batch = await Post.find({ tags: tag })
+        .limit(BATCH_SIZE)
+        .select('_id');
+
+      if (batch.length === 0) {
+        documentsExist = false;
+        continue;
+      }
+
+      // Delete the particular  batch by IDs
+      const result = await Post.deleteMany({
+        _id: { $in: batch.map(doc => doc._id) }
+      });
+
+      totalDeleted += result.deletedCount;
+    }
+
+    if (totalDeleted === 0) {
+      throw new ApiError(400, `No posts found with tag '${tag}'`);
+    }
+
+    res.json({
+      success: true,
+      message: `Deleted ${totalDeleted} posts with tag '${tag}'`
+    });
+
+  } catch (err) {
+    next(err);
+  }
+});
 module.exports = router;
