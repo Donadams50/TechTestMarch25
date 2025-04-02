@@ -81,11 +81,16 @@ router.post('/', async (req, res, next) => {
 // but with my solution, the updatedAt will change even if no actual changes were made to the payload
 router.put('/:id', validateId, async (req, res, next) => {
   try {
-    const updates = req.body;
+    const { title, content, tags } = req.body;
     
+    if (title === '' || content === '') {
+      throw new ApiError(400, 'Title/content cannot be empty');
+    }
     const post = await Post.findByIdAndUpdate(
       req.params.id,
-      updates,
+      title,
+      content,
+      tags,
       { new: true } 
     );
     if (!post) throw new ApiError(404, 'Post not found'); 
@@ -96,7 +101,8 @@ router.put('/:id', validateId, async (req, res, next) => {
   }
 });
 
-// DELETE post (unexpected behavior if ID is malformed (Fixed) Created a validator middleware file in my helper folder)
+// DELETE post (unexpected behavior if ID is malformed (Fixed) 
+// // Created a validator middleware file in my helper folder), it validates the Id before proceeeding
 router.delete('/:id', validateId, async (req, res, next) => {
   try {
     const result = await Post.findByIdAndDelete(req.params.id);
@@ -107,14 +113,15 @@ router.delete('/:id', validateId, async (req, res, next) => {
   }
 });
 
-// search 
+// optimized search endpoint. an index on content and title have been created in the schema
+// Using "/search/all" instead of "/search" to avoid conflicts with the "GET by ID" route
 router.get('/search/all', async (req, res, next) => {
   try {
     const { q: searchTerm, page = 1, limit = 10 } = req.query;
 
     // Validating search term
     if (!searchTerm || searchTerm.trim() === '') {
-      return res.status(400).json({ error: 'Search query (q) is required' });
+      throw new ApiError(400, 'Search query (q) is required');
     }
 
     // Convert query parameters to numbers and validate pagination, limit is cap at 50 itmes
@@ -151,8 +158,9 @@ router.get('/search/all', async (req, res, next) => {
 });
 
 // Bulk delete endpoint.    
-// I used hard delete because UK  is big on GDPR compliance
-// I used the batch method because deleting long dataset takes times and MongoDB may kill long-running operations. Default timeout: 60 seconds
+// Depending on business need, I can either do soft delete or hard delete(permanant delete)
+// I used hard delete because UK is big on GDPR compliance
+// I used the batch method because deleting long dataset takes times and MongoDB may kill long-running operations. Default timeout: 60 seconds (Imagining I am deleting 100k records)
 router.delete('/', async (req, res, next) => {
   try {
     const { tag } = req.query;
